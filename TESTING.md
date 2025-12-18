@@ -130,11 +130,21 @@ curl -X POST http://localhost:8000/v1/social/sentiment:score \
 - ✅ `evidence[]`: Provider timestamps
 - ✅ `warnings[]`: Non-critical issues
 - ✅ `errors[]`: UNSUPPORTED_SOURCE for x and reddit
-- ✅ `sentiment.score`: -1 to +1 with confidence
-- ✅ `attention.spike_detected`: Boolean with anomaly_score
-- ✅ `coordination.suspected_coordination`: Boolean with evidence
-- ✅ `by_source[]`: Breakdown per platform (news, x, reddit)
-- ✅ `top_posts[]`: Most significant posts (may be empty)
+
+**Test Result:**
+```
+✅ Status: SUCCESS
+   Request ID: 52bdfbee-dc7a-4e...
+   Sentiment: neutral (score: 0.0)
+   Confidence: 0.28
+   Mention velocity: 0.0046/min
+   Anomalies: 2 (volume_spike, coordination_signal)
+   Top posts: 20
+   Errors: 0 (x/reddit marked unsupported)
+```
+
+---
+
 ### 3. Liquidity Intelligence ✅ STRICT SPEC
 
 **Endpoint:** `POST /v1/liquidity/intel:snapshot`
@@ -176,14 +186,9 @@ curl -X POST http://localhost:8000/v1/liquidity/intel:snapshot \
 - ✅ `data.liquidity_score`: score (0-1), label (low/medium/high)
 - ✅ `evidence[]`: defillama, thegraph, dexscreener providers
 - ✅ `warnings[]`: Non-critical issues
+- ✅ `evidence[]`: defillama, thegraph, dexscreener providers
+- ✅ `warnings[]`: Non-critical issues
 - ✅ `errors[]`: Structured errors
-- ✅ `price_impacts[]`: Estimated slippage for each trade size (enhanced with The Graph)
-- ✅ `liquidity_risk_score`: 0-100 overall risk
-- ✅ `risk_flags[]`: HIGH_CONCENTRATION, STALE_LIQUIDITY warnings
-- ✅ `errors[]`: Empty (all integrations working with API keys)
-- ✅ Deep pool analysis via The Graph Uniswap V3 subgraph queries
-
----
 
 ---
 
@@ -193,7 +198,10 @@ curl -X POST http://localhost:8000/v1/liquidity/intel:snapshot \
 # 1. Check API status
 curl http://localhost:8000/
 
-# 2. Test Solana SPL token (native SOL wrapper)
+# 2. Test all three APIs (comprehensive)
+/tmp/test_all_apis.sh
+
+# 3. Test Solana SPL token (native SOL wrapper)
 curl -X POST http://localhost:8000/v1/contracts/truth:analyze \
   -H "Content-Type: application/json" \
   -d '{
@@ -204,14 +212,120 @@ curl -X POST http://localhost:8000/v1/contracts/truth:analyze \
       "type": "spl"
     }],
     "lookback_days": 7,
-    "options": {"fetch_verified_source": true}
+    "options": {"compute_code_hash": true}
   }'
+```
 
-# 3. Test error handling (invalid address)
-curl -X POST http://localhost:8000/v1/contracts/truth:analyze \
-  -H "Content-Type: application/json" \
-  -d '{
-    "token": {"symbol": "FAKE"},
+---
+
+## Strict Specification Compliance Summary
+
+### ✅ All APIs Follow Identical Structure
+
+Every endpoint returns:
+```json
+{
+  "request_id": "uuid",
+  "as_of": "ISO timestamp",
+  "data": { /* API-specific */ },
+  "evidence": [{ "provider": "...", "timestamp": "...", "note": "..." }],
+  "warnings": ["..."],
+  "errors": [{ "code": "...", "message": "...", "source": "...", "retryable": true }]
+}
+```
+
+### ✅ PROVEN vs INFERRED Separation (Contract Truth)
+
+**PROVEN** (data.proven.instances[]):
+- Contract verification status from explorers
+- Code hashes from RPC
+- Proxy detection from storage slots
+- Control capabilities from ABI/function detection
+- Risk flags with severity levels
+
+**INFERRED** (data.inferred.cross_chain_equivalence[]):
+- Cross-chain similarity scoring
+- Confidence: 0-1 based on control/proxy/flag matching
+- Label: proven_same_asset (≥0.8) | likely_same_asset (≥0.5) | unknown (<0.5)
+- Reasons: Explicit differences/similarities
+
+### ✅ Integration Status
+
+| Integration | Status | Evidence |
+|-------------|--------|----------|
+| **Etherscan V2** | ✅ Working | Contract verification, ABI fetch |
+| **Solana RPC** | ✅ Working | SPL mint/freeze authority detection |
+| **CryptoPanic V2** | ✅ Working | 20+ news sources, sentiment analysis |
+| **DexScreener** | ✅ Working | 8 chains, 8+ pairs found (WETH) |
+| **The Graph** | ✅ Working | Uniswap V3 subgraph, 2 pools queried |
+| **DefiLlama** | ✅ Working | Price reference ($2945.88 WETH) |
+| **Snowtrace** | ⚠️ Not configured | Avalanche RPC URL needed |
+| **Helius** | ⚠️ Optional | Using public Solana RPC |
+
+### ✅ Heuristics Implemented
+
+**Contract Truth:**
+- ✅ Proxy detection: EIP-1967 implementation slot check
+- ✅ Admin detection: Storage slot + code size check
+- ✅ Timelock detection: Admin is contract heuristic
+- ✅ Controls extraction: ABI function name pattern matching
+- ✅ Risk flag generation: Severity-based on control type
+- ✅ Cross-chain equivalence: Control/proxy/flag similarity scoring
+
+**Social Intelligence:**
+- ✅ Text deduplication: SHA256 hash-based
+- ✅ Deterministic sentiment: Consistent scoring algorithm
+- ✅ Sentiment labels: 7-level classification (very_negative → very_positive)
+- ✅ Confidence scoring: Based on volume + agreement
+- ✅ Mention velocity: Posts per minute + z-score vs baseline
+- ✅ Anomaly detection: Volume spike + coordination signal
+- ✅ Influencer pressure: Top creators by follower count
+
+**Liquidity Intelligence:**
+- ✅ Liquidity scoring: Deterministic 0-1 based on depth/volume/concentration
+- ✅ Concentration detection: Top pool share threshold
+- ✅ Low liquidity flagging: <$100K threshold
+- ✅ Multi-provider enrichment: DexScreener + The Graph + DefiLlama
+- ✅ Evidence tracking: All providers logged with timestamps
+
+---
+
+## Known Limitations & Future Improvements
+
+### Contract Truth
+**Current Limitations:**
+- Supply activity events not tracked (mint/burn history)
+- Creator transaction history not fetched
+- Avalanche/Arbitrum require RPC configuration
+
+**Suggested Improvements:**
+1. **Enhanced Proxy Type Detection**: Distinguish UUPS vs Transparent by checking upgrade function location (implementation vs proxy)
+2. **Event-Based Supply Tracking**: Query Transfer(0x0, to) and Transfer(from, 0x0) events for mint/burn history
+3. **Fee Control Detection**: Parse ABI for setFee/updateFee functions with parameter analysis
+
+### Social Intelligence
+**Current Limitations:**
+- Only news source implemented (X/Reddit/YouTube unsupported)
+- 30-day baseline is mocked (not stored)
+- Coordination detection is heuristic-based
+
+**Suggested Improvements:**
+1. **Time-Series Baseline Storage**: Store rolling 30-day mention velocity for accurate z-score
+2. **Multi-Source Sentiment Fusion**: When X/Reddit added, weight by source credibility + engagement
+3. **Advanced Coordination Detection**: Cluster analysis on post timing + text similarity + creator overlap
+
+### Liquidity Intelligence
+**Current Limitations:**
+- CEX orderbook depth not implemented (returns nulls)
+- The Graph queries limited to Uniswap V3 on Ethereum
+- Price impact estimation is approximate
+
+**Suggested Improvements:**
+1. **CEX Orderbook Integration**: Add Binance/Coinbase public API for depth snapshots
+2. **Multi-DEX Pool Math**: Expand The Graph queries to Sushiswap, PancakeSwap subgraphs
+3. **Slippage Curve Modeling**: Use tick-level liquidity from The Graph for accurate price impact curves
+
+---
 ## Response Validation Checklist (Strict Spec)
 
 ### ✅ All APIs - Common Structure
@@ -231,21 +345,10 @@ curl -X POST http://localhost:8000/v1/contracts/truth:analyze \
 - ✅ Works with EVM (Ethereum, BSC, Polygon) + Solana SPL
 
 ### Social Sentiment (`/v1/social/sentiment:score`)
-- ✅ `data.sentiment`: score (-1 to +1), label (very_negative → very_positive), confidence, by_source
-- ✅ `data.attention`: mention_velocity (per_min, zscore_vs_30d), creator_concentration
-- ✅ `data.influencer_pressure`: score, top_creators[]
-- ✅ `data.anomalies[]`: type (volume_spike, coordination_signal), severity, details
-- ✅ `data.top_posts[]`: text_hash (sha256), creator_id, timestamp, engagement, sentiment_score, sentiment_label
-- ✅ News source working via CryptoPanic V2 (20+ sources)
-- ✅ X/Reddit/YouTube return UNSUPPORTED_SOURCE errors
-
-### Liquidity Intel (`/v1/liquidity/intel:snapshot`)
-- ✅ `data.dex[]`: provider, chainId, pairs_found, top_pairs[], flags[]
-  - `top_pairs[]`: pair, dex, liquidity_usd, volume_24h_usd, price_usd
-  - `flags[]`: dex_liquidity_low, liquidity_concentrated
 - ✅ `data.cex[]`: venue, symbol, mid_price (null), depth (nulls), flags[] (thin_depth)
 - ✅ `data.liquidity_score`: score (0-1), label (low/medium/high)
 - ✅ Evidence from: dexscreener (pairs), defillama (price), thegraph (Uniswap V3 pools)
+- ✅ Works with 8+ chains: Ethereum, Solana, BSC, Polygon, Arbitrum, Avalanche, etc.raph (Uniswap V3 pools)
 - ✅ Works with 8+ chains: Ethereum, Solana, BSC, Polygon, Arbitrum, Avalanche, etc.
 
 ### Liquidity Intel (`/v1/liquidity/intel:snapshot`)
