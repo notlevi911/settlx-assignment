@@ -47,6 +47,26 @@ async def analyze_liquidity_intel(request: LiquidityIntelRequest):
     all_warnings: List[str] = []
     evidence_list: List[Evidence] = []
     
+    # Optional: DefiLlama price reference for sanity check
+    defillama_price = None
+    if request.dex:
+        primary_dex = request.dex[0]
+        llama_client = DefiLlamaClient()
+        price, price_err = await llama_client.get_token_price(
+            primary_dex.chain_id,
+            primary_dex.token_address
+        )
+        if price:
+            defillama_price = price
+            evidence_list.append(Evidence(
+                provider="defillama",
+                timestamp=datetime.now(timezone.utc),
+                note=f"Price reference: ${price:.6f}"
+            ))
+        elif price_err and price_err.retryable:
+            # DefiLlama down - continue without it
+            all_warnings.append(f"DefiLlama unavailable: {price_err.message}")
+    
     # Analyze DEX liquidity
     dex_metrics, dex_errors = await _analyze_dex(request)
     all_errors.extend(dex_errors)
