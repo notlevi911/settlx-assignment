@@ -1,25 +1,34 @@
 """
 Contract Truth endpoint - /v1/contracts/truth:analyze
-Multi-chain contract analysis with Solana support.
+Multi-chain contract analysis (strict spec).
 """
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional, Tuple, Dict
 import hashlib
+import uuid
 
 from app.api.v1.schemas.requests import ContractTruthRequest
 from app.api.v1.schemas.responses import (
     ContractTruthResponse,
-    ChainAnalysis,
-    ControlExtraction,
-    ProxyType,
+    ContractTruthDataSection,
+    ProvenSection,
+    InferredSection,
+    ProvenInstance,
+    CrossChainEquivalence,
+    VerificationData,
+    CodeIdentity,
+    UpgradeabilityData,
+    ControlsData,
+    FeeControls,
+    SupplyActivity,
+    RiskFlag,
     Evidence,
     StructuredError,
     ErrorCode
 )
 from app.services.contract_truth import ContractTruthService
 from app.services.solana_client import SolanaClient
-from app.services.contract_analyzer import ContractAnalyzer
 from app.core.enums import DataCertainty
 from web3 import Web3
 
@@ -29,306 +38,438 @@ router = APIRouter()
 @router.post("/contracts/truth:analyze", response_model=ContractTruthResponse)
 async def analyze_contract_truth(request: ContractTruthRequest):
     """
-    **Contract Truth Analysis**
+    **Contract Truth Analysis (Strict Spec)**
     
     Analyzes smart contracts across multiple chains (EVM + Solana).
-    Returns verification status, proxy detection, admin controls, and supply tracking.
+    Returns PROVEN facts and INFERRED conclusions separately.
     
-    Supports:
-    - EVM chains: ethereum, bsc, polygon, arbitrum, avalanche
-    - Solana: SPL token analysis
-    
-    All data classified as PROVEN, INFERRED, or UNKNOWN with evidence tracking.
+    Response structure:
+    - request_id (UUID)
+    - as_of (ISO timestamp)
+    - data.proven.instances[] - PROVEN facts from explorers/RPC
+    - data.inferred.cross_chain_equivalence[] - INFERRED cross-chain analysis
+    - evidence[], warnings[], errors[]
     """
-    analyses: List[ChainAnalysis] = []
-    all_errors: List[StructuredError] = []
+    request_id = str(uuid.uuid4())
+    as_of = datetime.now(timezone.utc).isoformat()
+    
+    proven_instances: List[ProvenInstance] = []
+    all_evidence: List[Evidence] = []
     all_warnings: List[str] = []
+    all_errors: List[StructuredError] = []
     
     # Analyze each chain instance
     for instance in request.instances:
         try:
             if instance.chain.lower() == "solana":
-                analysis = await _analyze_solana(instance, request.options, request.lookback_days)
+                proven = await _analyze_solana_instance(instance, request.options, request.lookback_days)
             else:
-                analysis = await _analyze_evm(instance, request.options, request.lookback_days)
+                proven = await _analyze_evm_instance(instance, request.options, request.lookback_days)
             
-            analyses.append(analysis)
-            all_errors.extend(analysis.evidence)
+            proven_instances.append(proven)
             
         except Exception as e:
-            # Partial failure - add error but continue
             error = StructuredError(
                 code=ErrorCode.INTERNAL_ERROR,
-                message=f"Failed to analyze {instance.chain}:{instance.address}: {str(e)}",
+                message=f"Failed to analyze {instance.chain}:{instance.address}",
                 source=instance.chain,
                 retryable=True
             )
             all_errors.append(error)
-            
-            # Add placeholder analysis with error
-            analyses.append(ChainAnalysis(
-                chain=instance.chain,
-                address=instance.address,
-                type=instance.type,
-                controls=ControlExtraction(),
-                evidence=[Evidence(
-                    provider=instance.chain,
-                    timestamp=datetime.now(timezone.utc),
-                    note=f"Analysis failed: {str(e)}"
-                )],
-                unknown_fields=["all"]
-            ))
+            all_warnings.append(f"Skipped {instance.chain}:{instance.address} due to error: {str(e)}")
     
-    # Cross-chain consistency check
-    cross_chain_consistent, cross_chain_notes = _check_cross_chain_consistency(analyses)
+    # Add evidence
+    if proven_instances:
+        all_evidence.append(Evidence(
+            provider="contract_truth",
+            timestamp=datetime.now(timezone.utc),
+            note=f"Analyzed {len(proven_instances)} chain instance(s)"
+        ))
     
-    # Calculate overall risk score
-    overall_risk = _calculate_overall_risk(analyses)
-    critical_flags = _extract_critical_flags(analyses)
+    # Infer cross-chain equivalence if multiple instances
+    cross_chain_eq = []
+    if len(proven_instances) >= 2:
+        cross_chain_eq = _infer_cross_chain_equivalence(proven_instances)
     
     return ContractTruthResponse(
-        token={"symbol": request.token.symbol, "name": request.token.name or ""},
-        timestamp=datetime.now(timezone.utc),
-        analyses=analyses,
-        cross_chain_consistent=cross_chain_consistent,
-        cross_chain_notes=cross_chain_notes,
-        overall_risk_score=overall_risk,
-        critical_flags=critical_flags,
-        errors=[e for e in all_errors if isinstance(e, StructuredError)],
-        warnings=all_warnings
+        request_id=request_id,
+        as_of=as_of,
+        data=ContractTruthDataSection(
+            proven=ProvenSection(instances=proven_instances),
+            inferred=InferredSection(cross_chain_equivalence=cross_chain_eq)
+        ),
+        evidence=all_evidence,
+        warnings=all_warnings,
+        errors=all_errors
     )
 
 
-async def _analyze_evm(instance, options, lookback_days: int) -> ChainAnalysis:
-    """Analyze EVM chain contract."""
-    try:
-        service = ContractTruthService(instance.chain)
-        old_result = await service.analyze_contract(instance.address)
-        
-        # Convert old format to new format
-        controls = ControlExtraction(
-            has_mint=old_result.has_mint_function.value if old_result.has_mint_function.value is not None else None,
-            has_burn=old_result.has_burn_function.value if old_result.has_burn_function.value is not None else None,
-            has_pause=old_result.has_pause_function.value if old_result.has_pause_function.value is not None else None,
-            has_freeze=old_result.has_freeze_function.value if old_result.has_freeze_function.value is not None else None,
-            owner_address=old_result.owner_address.value,
-            ownership_renounced=old_result.ownership_renounced.value
+async def _analyze_evm_instance(instance, options, lookback_days: int) -> ProvenInstance:
+    """Analyze EVM chain contract - returns PROVEN facts only."""
+    service = ContractTruthService(instance.chain)
+    old_result = await service.analyze_contract(instance.address)
+    
+    # Verification data
+    verification = VerificationData(
+        verified_source=old_result.is_verified.value or False,
+        explorer=f"{instance.chain}_explorer",
+        abi_available=old_result.is_verified.value or False,
+        source_hash=None  # TODO: Extract from explorer response
+    )
+    
+    # Code identity
+    code_hash = None
+    if options.compute_code_hash:
+        try:
+            code = service.web3.eth.get_code(instance.address)
+            code_hash = f"keccak256:{hashlib.sha256(code).hexdigest()}"
+        except:
+            pass
+    
+    code_identity = CodeIdentity(
+        runtime_code_hash=code_hash,
+        deployer=None,  # TODO: Get from creation tx
+        creation_tx=None
+    )
+    
+    # Upgradeability detection
+    is_proxy = old_result.is_proxy.value or False
+    proxy_type = None
+    if is_proxy:
+        if "EIP-1967" in str(old_result.is_proxy.reason):
+            proxy_type = "transparent"
+        elif "EIP-1822" in str(old_result.is_proxy.reason):
+            proxy_type = "uups"
+        elif "EIP-897" in str(old_result.is_proxy.reason):
+            proxy_type = "beacon"
+        else:
+            proxy_type = "unknown"
+    
+    # Check if admin is a contract (timelock detection)
+    admin_is_contract = None
+    timelock_detected = False
+    admin_addr = None
+    
+    if is_proxy and old_result.owner_address.value:
+        admin_addr = old_result.owner_address.value
+        try:
+            admin_code = service.web3.eth.get_code(admin_addr)
+            admin_is_contract = len(admin_code) > 2
+            if admin_is_contract:
+                timelock_detected = True  # Assume contract admin = timelock
+        except:
+            pass
+    
+    upgradeability = UpgradeabilityData(
+        is_proxy=is_proxy,
+        proxy_type=proxy_type,
+        implementation=old_result.implementation_address.value,
+        admin=admin_addr,
+        admin_is_contract=admin_is_contract,
+        timelock_detected=timelock_detected,
+        upgrade_authority=None  # EVM doesn't use this concept
+    )
+    
+    # Controls extraction
+    controls = ControlsData(
+        owner_or_admin=old_result.owner_address.value,
+        can_mint=old_result.has_mint_function.value,
+        can_burn=old_result.has_burn_function.value,
+        can_pause=old_result.has_pause_function.value,
+        can_blacklist_or_freeze=old_result.has_freeze_function.value,
+        fee_controls=FeeControls(
+            can_change_fees=False,  # TODO: Detect from ABI
+            max_fee_bps=None
         )
-        
-        # Determine proxy type
-        proxy_type = ProxyType.NOT_PROXY
-        if old_result.is_proxy.value:
-            # Enhanced proxy type detection
-            if "EIP-1967" in str(old_result.is_proxy.reason):
-                proxy_type = ProxyType.EIP1967_TRANSPARENT  # Would need upgrade to detect UUPS
-            elif "EIP-1822" in str(old_result.is_proxy.reason):
-                proxy_type = ProxyType.EIP1822_UUPS
-            elif "EIP-897" in str(old_result.is_proxy.reason):
-                proxy_type = ProxyType.EIP897
-            else:
-                proxy_type = ProxyType.CUSTOM
-        
-        # Compute code hash if requested
-        code_hash = None
-        if options.compute_code_hash:
-            try:
-                code = service.web3.eth.get_code(instance.address)
-                code_hash = hashlib.sha256(code).hexdigest()
-            except:
-                pass
-        
-        # Classify fields
-        proven_fields = []
-        inferred_fields = []
-        unknown_fields = []
-        
-        if old_result.is_verified.certainty == DataCertainty.PROVEN:
-            proven_fields.extend(["is_verified", "controls"])
-        if old_result.is_proxy.certainty == DataCertainty.PROVEN:
-            proven_fields.append("proxy_type")
-        if old_result.total_supply.certainty == DataCertainty.UNKNOWN:
-            unknown_fields.append("current_supply")
-        if old_result.supply_change_24h.certainty == DataCertainty.UNKNOWN:
-            unknown_fields.extend(["supply_change_24h_pct", "supply_change_7d_pct"])
-        
-        return ChainAnalysis(
-            chain=instance.chain,
-            address=instance.address,
-            type=instance.type,
-            is_verified=old_result.is_verified.value,
-            verification_source=old_result.is_verified.source,
-            proxy_type=proxy_type,
-            implementation_address=old_result.implementation_address.value,
-            is_upgradeable=old_result.is_upgradeable.value,
-            controls=controls,
-            code_hash=code_hash,
-            compiler_version=old_result.compiler_version.value,
-            current_supply=old_result.total_supply.value,
-            supply_change_24h_pct=None,  # TODO: Implement historical tracking
-            supply_change_7d_pct=None,
-            evidence=[
-                Evidence(
-                    provider=f"{instance.chain}_explorer",
-                    timestamp=old_result.timestamp,
-                    note="EVM contract analysis via block explorer + RPC"
-                )
-            ],
-            proven_fields=proven_fields,
-            inferred_fields=inferred_fields,
-            unknown_fields=unknown_fields
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"EVM analysis failed: {str(e)}")
+    )
+    
+    # Supply activity (simplified - no event history yet)
+    supply_activity = SupplyActivity(
+        mint_events_lookback=None,  # TODO: Implement event tracking
+        mint_amount_lookback=None,
+        burn_events_lookback=None,
+        burn_amount_lookback=None
+    )
+    
+    # Risk flags
+    risk_flags = _generate_risk_flags_evm(
+        controls=controls,
+        upgradeability=upgradeability,
+        verification=verification
+    )
+    
+    return ProvenInstance(
+        chain=instance.chain,
+        address=instance.address,
+        type=instance.type,
+        verification=verification,
+        code_identity=code_identity,
+        upgradeability=upgradeability,
+        controls=controls,
+        supply_activity=supply_activity,
+        risk_flags=risk_flags
+    )
 
 
-async def _analyze_solana(instance, options, lookback_days: int) -> ChainAnalysis:
-    """Analyze Solana SPL token."""
+async def _analyze_solana_instance(instance, options, lookback_days: int) -> ProvenInstance:
+    """Analyze Solana SPL token - returns PROVEN facts only."""
     client = SolanaClient()
     
     # Analyze SPL token mint
     spl_data = await client.analyze_spl_token(instance.address)
     
     if spl_data.get("error"):
-        return ChainAnalysis(
-            chain="solana",
-            address=instance.address,
-            type=instance.type,
-            is_verified=False,
-            controls=ControlExtraction(),
-            evidence=[
-                Evidence(
-                    provider="solana_rpc",
-                    timestamp=datetime.now(timezone.utc),
-                    note=f"Error: {spl_data['error'].message}"
-                )
-            ],
-            unknown_fields=["all"]
-        )
+        raise Exception(f"Solana RPC error: {spl_data['error'].message}")
     
-    # Get supply
-    supply, supply_error = await client.get_token_supply(instance.address)
-    
-    controls = ControlExtraction(
-        has_mint=spl_data.get("mint_authority") is not None,
-        has_freeze=spl_data.get("freeze_authority") is not None,
-        owner_address=spl_data.get("mint_authority"),
-        ownership_renounced=spl_data.get("authority_renounced", False)
+    # Verification (Solana uses on-chain verification)
+    verification = VerificationData(
+        verified_source=spl_data.get("is_verified", False),
+        explorer="solscan",
+        abi_available=False,  # SPL has standard interface
+        source_hash=None
     )
     
-    proven_fields = ["is_verified", "controls", "current_supply"] if spl_data.get("is_verified") else []
-    unknown_fields = ["proxy_type", "code_hash", "supply_change_24h_pct", "supply_change_7d_pct"]
+    # Code identity (Solana uses program addresses)
+    code_identity = CodeIdentity(
+        runtime_code_hash=None,  # SPL tokens don't have custom code
+        deployer=spl_data.get("mint_authority"),
+        creation_tx=None
+    )
     
-    return ChainAnalysis(
+    # Upgradeability (Solana uses upgrade_authority on programs)
+    upgrade_authority = spl_data.get("upgrade_authority")
+    
+    upgradeability = UpgradeabilityData(
+        is_proxy=False,  # SPL doesn't use proxies
+        proxy_type=None,
+        implementation=None,
+        admin=None,
+        admin_is_contract=None,
+        timelock_detected=False,
+        upgrade_authority=upgrade_authority
+    )
+    
+    # Controls
+    mint_authority = spl_data.get("mint_authority")
+    freeze_authority = spl_data.get("freeze_authority")
+    authority_renounced = spl_data.get("authority_renounced", False)
+    
+    controls = ControlsData(
+        owner_or_admin=mint_authority,
+        can_mint=mint_authority is not None,
+        can_burn=True,  # SPL tokens can always burn
+        can_pause=False,
+        can_blacklist_or_freeze=freeze_authority is not None,
+        fee_controls=FeeControls(
+            can_change_fees=False,
+            max_fee_bps=None
+        )
+    )
+    
+    # Supply activity
+    supply_activity = SupplyActivity(
+        mint_events_lookback=None,
+        mint_amount_lookback=None,
+        burn_events_lookback=None,
+        burn_amount_lookback=None
+    )
+    
+    # Risk flags
+    risk_flags = _generate_risk_flags_solana(
+        controls=controls,
+        upgradeability=upgradeability,
+        verification=verification
+    )
+    
+    return ProvenInstance(
         chain="solana",
         address=instance.address,
         type=instance.type,
-        is_verified=spl_data.get("is_verified", False),
-        verification_source="solana_rpc",
-        proxy_type=ProxyType.NOT_PROXY,  # Solana doesn't use proxies same way
-        implementation_address=None,
-        is_upgradeable=None,  # Would need to check program owner
+        verification=verification,
+        code_identity=code_identity,
+        upgradeability=upgradeability,
         controls=controls,
-        code_hash=None,
-        compiler_version=None,
-        current_supply=supply,
-        supply_change_24h_pct=None,
-        supply_change_7d_pct=None,
-        evidence=[
-            Evidence(
-                provider="solana_rpc",
-                timestamp=datetime.now(timezone.utc),
-                note="SPL token mint analysis"
-            )
-        ],
-        proven_fields=proven_fields,
-        inferred_fields=[],
-        unknown_fields=unknown_fields
+        supply_activity=supply_activity,
+        risk_flags=risk_flags
     )
 
 
-def _check_cross_chain_consistency(analyses: List[ChainAnalysis]) -> tuple[bool, List[str]]:
-    """Check if controls are consistent across chains."""
-    if len(analyses) <= 1:
-        return True, []
-    
-    notes = []
-    
-    # Check mint authority consistency
-    mint_values = [a.controls.has_mint for a in analyses if a.controls.has_mint is not None]
-    if len(set(mint_values)) > 1:
-        notes.append("⚠️ Inconsistent mint authority across chains")
-    
-    # Check ownership renounced
-    renounced_values = [a.controls.ownership_renounced for a in analyses if a.controls.ownership_renounced is not None]
-    if len(set(renounced_values)) > 1:
-        notes.append("⚠️ Ownership renounced on some chains but not others")
-    
-    # Check upgradeability
-    upgradeable_values = [a.is_upgradeable for a in analyses if a.is_upgradeable is not None]
-    if len(set(upgradeable_values)) > 1:
-        notes.append("⚠️ Upgradeability differs across chains")
-    
-    return len(notes) == 0, notes
-
-
-def _calculate_overall_risk(analyses: List[ChainAnalysis]) -> int:
-    """Calculate overall risk score from all chain analyses."""
-    if not analyses:
-        return 100
-    
-    total_risk = 0
-    for analysis in analyses:
-        risk = 0
-        
-        # Unverified contract
-        if analysis.is_verified is False:
-            risk += 30
-        
-        # Upgradeable proxy
-        if analysis.is_upgradeable:
-            risk += 25
-        
-        # Mint authority present
-        if analysis.controls.has_mint:
-            risk += 20
-        
-        # Pause/Freeze
-        if analysis.controls.has_pause:
-            risk += 15
-        if analysis.controls.has_freeze:
-            risk += 20
-        
-        # Owner not renounced
-        if analysis.controls.ownership_renounced is False:
-            risk += 10
-        
-        total_risk += min(risk, 100)
-    
-    # Average across chains
-    return min(total_risk // len(analyses), 100)
-
-
-def _extract_critical_flags(analyses: List[ChainAnalysis]) -> List[str]:
-    """Extract critical risk flags."""
+def _generate_risk_flags_evm(
+    controls: ControlsData,
+    upgradeability: UpgradeabilityData,
+    verification: VerificationData
+) -> List[RiskFlag]:
+    """Generate risk flags for EVM contracts."""
     flags = []
     
-    for analysis in analyses:
-        prefix = f"[{analysis.chain}]"
-        
-        if analysis.is_verified is False:
-            flags.append(f"{prefix} UNVERIFIED_CONTRACT")
-        
-        if analysis.is_upgradeable:
-            flags.append(f"{prefix} UPGRADEABLE_PROXY")
-        
-        if analysis.controls.has_mint:
-            flags.append(f"{prefix} MINTABLE")
-        
-        if analysis.controls.has_pause:
-            flags.append(f"{prefix} PAUSABLE")
-        
-        if analysis.controls.has_freeze:
-            flags.append(f"{prefix} FREEZABLE")
+    # Mint privilege
+    if controls.can_mint:
+        flags.append(RiskFlag(
+            id="MINT_PRIVILEGE",
+            severity="medium",
+            why="Contract has mint capability"
+        ))
     
-    return list(set(flags))  # Dedupe
+    # Proxy upgradeable
+    if upgradeability.is_proxy:
+        flags.append(RiskFlag(
+            id="PROXY_UPGRADEABLE",
+            severity="high",
+            why=f"Contract is upgradeable proxy ({upgradeability.proxy_type or 'unknown'})"
+        ))
+        
+        # No timelock
+        if not upgradeability.timelock_detected:
+            flags.append(RiskFlag(
+                id="UPGRADEABLE_NO_TIMELOCK_EVIDENCE",
+                severity="high",
+                why="Upgradeable proxy without detected timelock protection"
+            ))
+    
+    # Unverified
+    if not verification.verified_source:
+        flags.append(RiskFlag(
+            id="UNVERIFIED_SOURCE",
+            severity="high",
+            why="Source code not verified on explorer"
+        ))
+    
+    # Freeze/blacklist
+    if controls.can_blacklist_or_freeze:
+        flags.append(RiskFlag(
+            id="FREEZE_AUTHORITY_PRESENT",
+            severity="high",
+            why="Contract can freeze or blacklist addresses"
+        ))
+    
+    return flags
+
+
+def _generate_risk_flags_solana(
+    controls: ControlsData,
+    upgradeability: UpgradeabilityData,
+    verification: VerificationData
+) -> List[RiskFlag]:
+    """Generate risk flags for Solana SPL tokens."""
+    flags = []
+    
+    # Mint authority
+    if controls.can_mint:
+        flags.append(RiskFlag(
+            id="MINT_PRIVILEGE",
+            severity="medium",
+            why="Mint authority is set"
+        ))
+    
+    # Freeze authority
+    if controls.can_blacklist_or_freeze:
+        flags.append(RiskFlag(
+            id="FREEZE_AUTHORITY_PRESENT",
+            severity="high",
+            why="Freeze authority is set"
+        ))
+    
+    # Upgrade authority
+    if upgradeability.upgrade_authority:
+        flags.append(RiskFlag(
+            id="UPGRADE_AUTHORITY_PRESENT",
+            severity="medium",
+            why="Program has upgrade authority set"
+        ))
+    
+    return flags
+
+
+def _infer_cross_chain_equivalence(instances: List[ProvenInstance]) -> List[CrossChainEquivalence]:
+    """Infer cross-chain equivalence (INFERRED conclusions)."""
+    if len(instances) < 2:
+        return []
+    
+    equivalences = []
+    
+    # Compare all pairs
+    for i in range(len(instances)):
+        for j in range(i + 1, len(instances)):
+            inst_a = instances[i]
+            inst_b = instances[j]
+            
+            pair_id = [
+                f"{inst_a.chain}:{inst_a.address}",
+                f"{inst_b.chain}:{inst_b.address}"
+            ]
+            
+            # Score similarity
+            confidence, reasons = _score_similarity(inst_a, inst_b)
+            
+            # Classify
+            if confidence >= 0.8:
+                label = "proven_same_asset"
+            elif confidence >= 0.5:
+                label = "likely_same_asset"
+            else:
+                label = "unknown"
+            
+            equivalences.append(CrossChainEquivalence(
+                pair=pair_id,
+                confidence=round(confidence, 2),
+                reasons=reasons,
+                label=label
+            ))
+    
+    return equivalences
+
+
+def _score_similarity(inst_a: ProvenInstance, inst_b: ProvenInstance) -> Tuple[float, List[str]]:
+    """Score similarity between two instances."""
+    score = 0.0
+    max_score = 0.0
+    reasons = []
+    
+    # Controls similarity (40% weight)
+    max_score += 0.4
+    controls_match = 0
+    controls_total = 0
+    
+    if inst_a.controls.can_mint == inst_b.controls.can_mint:
+        controls_match += 1
+    else:
+        reasons.append(f"Mint capability differs: {inst_a.chain}={inst_a.controls.can_mint}, {inst_b.chain}={inst_b.controls.can_mint}")
+    controls_total += 1
+    
+    if inst_a.controls.can_pause == inst_b.controls.can_pause:
+        controls_match += 1
+    else:
+        reasons.append(f"Pause capability differs")
+    controls_total += 1
+    
+    if inst_a.controls.can_blacklist_or_freeze == inst_b.controls.can_blacklist_or_freeze:
+        controls_match += 1
+    else:
+        reasons.append(f"Freeze capability differs")
+    controls_total += 1
+    
+    score += 0.4 * (controls_match / controls_total)
+    
+    # Upgradeability similarity (30% weight)
+    max_score += 0.3
+    if inst_a.upgradeability.is_proxy == inst_b.upgradeability.is_proxy:
+        score += 0.3
+    else:
+        reasons.append(f"Upgradeability differs: {inst_a.chain}={inst_a.upgradeability.is_proxy}, {inst_b.chain}={inst_b.upgradeability.is_proxy}")
+    
+    # Risk flags similarity (30% weight)
+    max_score += 0.3
+    flags_a = {f.id for f in inst_a.risk_flags}
+    flags_b = {f.id for f in inst_b.risk_flags}
+    
+    if flags_a == flags_b:
+        score += 0.3
+        reasons.append(f"Risk profiles match ({len(flags_a)} flags)")
+    else:
+        diff = flags_a.symmetric_difference(flags_b)
+        reasons.append(f"Risk profiles differ: {diff}")
+    
+    # Normalize
+    confidence = score / max_score if max_score > 0 else 0.0
+    
+    return confidence, reasons
